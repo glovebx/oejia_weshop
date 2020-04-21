@@ -6,14 +6,15 @@
             <field name="name">wxapp.product.category.view_tree</field>
             <field name="model">wxapp.product.category</field>
             <field name="type">tree</field>
+            <field name="priority">999</field>
             <field name="arch" type="xml">
                 <tree string="商品分类">
+               <field name="sort" widget="handle"/>
                <field name="name"/>
                <field name="pid"/>
-               <field name="sort"/>
                <field name="is_use"/>
-               <field name="key"/>
                <field name="level"/>
+               <field name="key"/>
                 </tree>
             </field>
         </record>
@@ -21,6 +22,7 @@
             <field name="name">wxapp.product.category.view_form</field>
             <field name="model">wxapp.product.category</field>
             <field name="type">form</field>
+            <field name="priority">999</field>
             <field name="arch" type="xml">
                 <form string="商品分类" version="7.0">
                     <sheet>
@@ -28,9 +30,11 @@
                <field name="name"/>
                <field name="pid"/>
                <field name="sort"/>
-               <field name="icon"/>
+               <field name="icon" widget="image"/>
                <field name="is_use"/>
                <field name="key"/>
+               <field name="product_template_ids" widget="many2many_tags"/>
+               <field name="child_ids" widget="many2many_tags"/>
                     </group>
                     </sheet>
                 </form>
@@ -48,7 +52,7 @@
                           (0, 0, {'view_mode': 'form', 'view_id': ref('wxapp_product_category_view_form_1007')}),
                     ]"/>
         </record>
-        <menuitem action="wxapp_product_category_action_406" id="wxapp_product_category_menuitem_324_1536754696" name="商品分类" parent="parent_menu_327_1536754696" sequence="2"/>
+        <menuitem action="wxapp_product_category_action_406" id="wxapp_product_category_menuitem_324_1536754696" name="商品分类" parent="parent_menu_327_1536754696" sequence="2" groups="oejia_weshop.group_wxapp_sale,base.group_system"/>
 
     </data>
 </openerp>

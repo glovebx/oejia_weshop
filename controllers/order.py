@@ -2,11 +2,11 @@
 
 import json
 
-from odoo import http, exceptions
+from odoo import http
 from odoo.http import request
 
 from .. import defs
-from .base import BaseController
+from .base import BaseController, dt_convert, UserException
 
 import logging
 
@@ -15,58 +15,97 @@ _logger = logging.getLogger(__name__)
 
 class WxappOrder(http.Controller, BaseController):
 
-    @http.route('/<string:sub_domain>/order/create',
+    @http.route('/wxa/<string:sub_domain>/order/create',
                 auth='public', methods=['POST'], csrf=False, type='http')
     def create(self, sub_domain, **kwargs):
         token = kwargs.pop('token', None)
+        team_id = kwargs.pop('team', None)
         try:
             res, wechat_user, entry = self._check_user(sub_domain, token)
             if res:return res
 
+            res = self.pre_check(entry, wechat_user, kwargs)
+            if res:return res
+
             # [{"goodsId":1,"number":3,"propertyChildIds":"1:1,2:4,","logisticsType":0, "inviter_id":0}]
             goods_json = json.loads(kwargs.pop('goodsJsonStr'))
-            province_id = int(kwargs.pop('provinceId'))
-            city_id = int(kwargs.pop('cityId'))
-            district_id = int(kwargs.pop('districtId')) if 'districtId' in kwargs.keys() else False
-            zipcode = kwargs.pop('code')
-            calculate = kwargs.pop('calculate', False)
 
-            goods_price, logistics_price, total, goods_list = self.parse_goods_json(
+            province_id = int(kwargs.pop('provinceId')) if 'provinceId' in kwargs else False
+            city_id = int(kwargs.pop('cityId')) if 'cityId' in kwargs else False
+            district_id = int(kwargs.pop('districtId')) if 'districtId' in kwargs else False
+            zipcode = kwargs.pop('code') if 'code' in kwargs else False
+            link_man = kwargs.pop('linkMan') if 'linkMan' in kwargs else False
+
+            calculate = kwargs.pop('calculate', False)
+            remark = kwargs.pop('remark', '')
+
+            goods_price, logistics_price, order_lines = self.parse_goods_json(
                 goods_json, province_id, city_id, district_id, calculate
             )
 
+            address = request.env(user=1)['res.partner'].search([
+                ('parent_id', '=', wechat_user.partner_id.id),
+                ('type', '=', 'delivery'),
+                ('is_default', '=', True)
+            ], limit=1)
             order_dict = {
                 'zipcode': zipcode,
                 'partner_id': wechat_user.partner_id.id,
-                'number_goods': sum(map(lambda r: r['product_uom_qty'], goods_list)),
-                'goods_price': goods_price,
+                'number_goods': sum(map(lambda r: r['product_uom_qty'], order_lines)),
                 'logistics_price': logistics_price,
-                'total': total,
                 'province_id': province_id,
                 'city_id': city_id,
                 'district_id': district_id,
-                'team_id': entry.team_id.id
+                'team_id': team_id and int(team_id) or entry.team_id.id,
+                'note': remark,
+                'linkman': link_man,
+                'partner_shipping_id': address and address.id or wechat_user.partner_id.id,
+                'user_id': wechat_user.partner_id.user_id.id,
+                'goods_price': goods_price,
+                'extra': {},
             }
             order_dict.update(kwargs)
+            _logger.info('>>> order_dict %s', order_dict)
+            order_logistics = self.calculate_order_logistics(wechat_user, order_dict, order_lines)
+            if order_logistics:
+                order_dict['logistics_price'] = order_logistics
+            self.after_calculate(wechat_user, order_dict, order_lines)
 
             if calculate:
                 _data = {
                     'score': 0,
                     'isNeedLogistics': 1,
-                    'amountTotle': goods_price,
-                    'amountLogistics': logistics_price,
+                    'amountTotle': round(order_dict['goods_price'], 2),
+                    'amountLogistics': order_dict['logistics_price'],
+                    'extra': order_dict['extra']
                 }
+                _data.update(self.calculate_ext_info(wechat_user, order_dict, order_lines, _data))
+                for line in order_lines:
+                    line['price_unit'] = round(line['price_unit'], 2)
+                _data['orderLines'] = order_lines
             else:
+                order_dict.pop('goods_price')
+                order_dict.pop('extra')
                 order = request.env(user=1)['sale.order'].create(order_dict)
-                for each_goods in goods_list:
-                    each_goods['order_id'] = order.id
-                    request.env(user=1)['sale.order.line'].create(each_goods)
+                for line in order_lines:
+                    if 'goods_id' in line:
+                        line.pop('goods_id')
+                    line['order_id'] = order.id
+                    request.env(user=1)['sale.order.line'].create(line)
+                if order_dict['logistics_price']>0:
+                    request.env(user=1)['sale.order.line'].create({
+                        'order_id': order.id,
+                        'product_id': request.env.ref('oejia_weshop.product_product_delivery_weshop').id,
+                        'price_unit': order_dict['logistics_price'],
+                        'product_uom_qty': 1,
+                    })
 
                 #mail_template = request.env.ref('wechat_mall_order_create')
                 #mail_template.sudo().send_mail(order.id, force_send=True, raise_exception=False)
+                order.action_created(order_dict)
                 _data = {
-                    "amountReal": order.total,
-                    "dateAdd": order.create_date,
+                    "amountReal": round(order.amount_total, 2),
+                    "dateAdd": dt_convert(order.create_date),
                     "id": order.id,
                     "orderNumber": order.name,
                     "status": defs.OrderResponseStatus.attrs[order.customer_status],
@@ -75,9 +114,20 @@ class WxappOrder(http.Controller, BaseController):
 
             return self.res_ok(_data)
 
+        except UserException as e:
+            return self.res_err(-99, str(e))
         except Exception as e:
             _logger.exception(e)
-            return self.res_err(-1, e.message)
+            return self.res_err(-1, str(e))
+
+    def calculate_order_logistics(self, wechat_user, order_dict, order_lines):
+        pass
+
+    def after_calculate(self, wechat_user, order_dict, order_lines):
+        pass
+
+    def calculate_ext_info(self, wechat_user, order_dict, goods_list, init_info):
+        return {}
 
     def parse_goods_json(self, goods_json, province_id, city_id, district_id, calculate):
         """
@@ -85,11 +135,11 @@ class WxappOrder(http.Controller, BaseController):
         :param province_id: 省
         :param city_id: 市
         :param district_id: 区
-        :return: goods_price, logistics_price, total, goods_list
+        :return: goods_fee, logistics_fee, order_lines
         """
         # [{"goodsId":1,"number":3,"propertyChildIds":"1:1,2:4,","logisticsType":0, "inviter_id":0}]
-        goods_price, logistics_price = 0.0, 0.0
-        goods_list = []
+        goods_fee, logistics_fee = 0.0, 0.0
+        order_lines = []
 
         goods_id_set = set(map(lambda r: r['goodsId'], goods_json))
         product_list = []
@@ -106,8 +156,8 @@ class WxappOrder(http.Controller, BaseController):
         ])
         template_dict = {template.id: template for template in template_list}
 
-        if set(template_dict.keys()) - goods_id_set:
-            raise exceptions.ValidationError('订单中包含已下架的商品')
+        if goods_id_set - set(template_dict.keys()):
+            raise UserException('订单中包含已下架的商品')
 
         for each_goods in goods_json:
             property_child_ids = each_goods.get('propertyChildIds')
@@ -115,19 +165,19 @@ class WxappOrder(http.Controller, BaseController):
             transport_type = each_goods['logisticsType']
             template = template_dict[each_goods['goodsId']]
 
-            each_goods_price, each_goods_total, property_str, product = self.calculate_goods_fee(template, amount, property_child_ids, calculate)
+            each_goods_total, line_dict = self.calculate_goods_fee(template, amount, property_child_ids, calculate)
             each_logistics_price = self.calculate_logistics_fee(template, amount, transport_type, province_id, city_id, district_id)
-            goods_list.append({
-                'product_id': product.id,
-                'price_unit': each_goods_price,
-                'product_uom_qty': amount,
-            })
-            goods_price += each_goods_total
-            logistics_price += each_logistics_price
+            order_lines.append(line_dict)
+            goods_fee += each_goods_total
+            if each_logistics_price<0:
+                logistics_fee = abs(each_logistics_price)
+            else:
+                logistics_fee += each_logistics_price
 
-        return goods_price, logistics_price, goods_price + logistics_price, goods_list
+        return goods_fee, logistics_fee, order_lines
 
     def calculate_goods_fee(self, goods, amount, property_child_ids, calculate):
+        _logger.info('>>> calculate_goods_fee %s %s %s', goods, amount, property_child_ids)
         property_str = ''
 
         if 1:#property_child_ids:
@@ -136,34 +186,48 @@ class WxappOrder(http.Controller, BaseController):
                 ('product_tmpl_id', '=', goods.id),
                 ('attr_val_str', '=', property_child_ids)
             ])
+            if not property_child_ids and not product:
+                product = request.env['product.product'].sudo().search([
+                    ('product_tmpl_id', '=', goods.id),
+                    ('attr_val_str', '=', False)
+                ])
             if not product:
-                raise exceptions.ValidationError('商品不存在！')
+                raise UserException('商品不存在！')
 
-            price = product.present_price or goods.list_price
+            price = product.get_present_price(amount)
             total = price * amount
             property_str = product.name
 
-            stores = product.qty_public - amount
+            stores = product.get_present_qty() - amount
             if not property_child_ids:
-                stores = goods.qty_public_tpl - amount
+                stores = goods.get_present_qty() - amount
 
             if stores < 0:
-                raise exceptions.ValidationError('库存不足！')
+                raise UserException('%s 库存不足！'%goods.name)
             if stores == 0:
                 # todo 发送库存空预警
                 pass
             if not calculate:
-                product.sudo().write({'qty_public': stores})
+                product.sudo().change_qty(-amount)
                 if not property_child_ids:
-                    goods.sudo().write({'qty_public_tpl': stores})
+                    goods.sudo().change_qty(-amount)
 
-        return price, total, property_str, product
+        line_dict = {
+            'product_id': product.id,
+            'goods_id': goods.id,
+            'price_unit': price,
+            'product_uom_qty': amount,
+        }
+        return total, line_dict
 
     def calculate_logistics_fee(self, goods, amount, transport_type, province_id, city_id, district_id):
         return 0
 
+    def pre_check(self, entry, wechat_user, post_data):
+        return
 
-    @http.route('/<string:sub_domain>/order/statistics', auth='public', method=['GET'])
+
+    @http.route('/wxa/<string:sub_domain>/order/statistics', auth='public', method=['GET', 'POST'], csrf=False)
     def statistics(self, sub_domain, token=None, **kwargs):
         '''
         closed = ('closed', u'已关闭')
@@ -177,7 +241,7 @@ class WxappOrder(http.Controller, BaseController):
             res, wechat_user, entry = self._check_user(sub_domain, token)
             if res:return res
 
-            orders = request.env['sale.order'].sudo().search([('partner_id', '=', wechat_user.partner_id.id)])
+            orders = request.env['sale.order'].sudo().search([('partner_id', '=', wechat_user.partner_id.id), ('number_goods', '>', 0)])
             order_statistics_dict = {order_status: 0 for order_status in defs.OrderStatus.attrs.keys()}
             for each_order in orders:
                 order_statistics_dict[each_order.customer_status] += 1
@@ -194,49 +258,57 @@ class WxappOrder(http.Controller, BaseController):
 
         except Exception as e:
             _logger.exception(e)
-            return self.res_err(-1, e.message)
+            return self.res_err(-1, str(e))
 
+    def _order_basic_dict(self, each_order):
+        ret = {
+            "amountReal": round(each_order.amount_total, 2),
+            "dateAdd": dt_convert(each_order.create_date),
+            "id": each_order.id,
+            "remark": each_order.note,
+            "orderNumber": each_order.name,
+            "goodsNumber": each_order.number_goods,
+            "status": defs.OrderResponseStatus.attrs[each_order.customer_status],
+            "statusStr": defs.OrderStatus.attrs[each_order.customer_status],
+            "score": 0,
+        }
+        return ret
 
-    @http.route('/<string:sub_domain>/order/list', auth='public', method=['GET'])
+    def get_orders_domain(self, status, **kwargs):
+        domain = [('partner_id', '=', request.wechat_user.partner_id.id), ('number_goods', '>', 0)]
+        if status:
+            domain.append(('customer_status', '=', defs.OrderRequestStatus.attrs[int(status)]))
+        return domain
+
+    @http.route('/wxa/<string:sub_domain>/order/list', auth='public', method=['GET', 'POST'], csrf=False)
     def list(self, sub_domain, token=None, status=None, **kwargs):
         try:
             res, wechat_user, entry = self._check_user(sub_domain, token)
             if res:return res
 
-            if status is not None:
-                orders = request.env['sale.order'].sudo().search([
-                    ('partner_id', '=', wechat_user.partner_id.id),
-                    ('customer_status', '=', defs.OrderRequestStatus.attrs[int(status)])
-                ])
-            else:
-                orders = request.env['sale.order'].search([
-                    ('partner_id', '=', wechat_user.partner_id)
-                ])
-
+            domain = self.get_orders_domain(status, **kwargs)
+            orders = request.env['sale.order'].sudo().search(domain, order='id desc', limit=30)
+            delivery_product_id = request.env.ref('oejia_weshop.product_product_delivery_weshop').id
             data = {
-                "orderList": [{
-                    "amountReal": each_order.total,
-                    "dateAdd": each_order.create_date,
-                    "id": each_order.id,
-                    "orderNumber": each_order.name,
-                    "status": defs.OrderResponseStatus.attrs[each_order.customer_status],
-                    "statusStr": defs.OrderStatus.attrs[each_order.customer_status],
-                } for each_order in orders],
+                "logisticsMap": {},
+                "orderList": [self._order_basic_dict(each_order) for each_order in orders],
                 "goodsMap": {
                     each_order.id: [
                         {
-                            "pic": each_goods.product_id.product_tmpl_id.get_main_image(),
-                        } for each_goods in each_order.order_line]
+                            "pic": each_goods.product_id.product_tmpl_id.main_img,
+                        } for each_goods in each_order.order_line if each_goods.product_id.id!=delivery_product_id]
                     for each_order in orders}
             }
+            if not data['orderList']:
+                return self.res_err(700)
             return self.res_ok(data)
 
         except Exception as e:
             _logger.exception(e)
-            return self.res_err(-1, e.message)
+            return self.res_err(-1, str(e))
 
 
-    @http.route('/<string:sub_domain>/order/detail', auth='public', method=['GET'])
+    @http.route('/wxa/<string:sub_domain>/order/detail', auth='public', method=['GET'])
     def detail(self, sub_domain, token=None, id=None, **kwargs):
         order_id = id
         try:
@@ -254,20 +326,16 @@ class WxappOrder(http.Controller, BaseController):
             if not order:
                 return self.res_err(404)
 
-            if order.shipper_traces:
-                traces = json.loads(order.shipper_traces).get('data', {})
-            else:
-                traces = {}
-
+            delivery_product_id = request.env.ref('oejia_weshop.product_product_delivery_weshop').id
             data = {
                 "code": 0,
                 "data": {
                     "orderInfo": {
                         "amount": order.goods_price,
                         "amountLogistics": order.logistics_price,
-                        "amountReal": order.total,
-                        "dateAdd": order.create_date,
-                        "dateUpdate": order.write_date,
+                        "amountReal": round(order.amount_total, 2),
+                        "dateAdd": dt_convert(order.create_date),
+                        "dateUpdate": dt_convert(order.write_date),
                         "goodsNumber": order.number_goods,
                         "id": order.id,
                         "orderNumber": order.name,
@@ -280,46 +348,53 @@ class WxappOrder(http.Controller, BaseController):
                     },
                     "goods": [
                         {
-                            "amount": each_goods.product_id.price,
+                            "amount": each_goods.price_unit,
                             "goodsId": each_goods.product_id.product_tmpl_id.id,
-                            "goodsName": each_goods.product_id.name,
-                            "id": each_goods.id,
+                            "goodsName": each_goods.name,
+                            "id": each_goods.product_id.id,
                             "number": each_goods.product_uom_qty,
                             "orderId": order.id,
-                            "pic": each_goods.product_id.product_tmpl_id.get_main_image(),
+                            "pic": each_goods.product_id.product_tmpl_id.main_img,
                             "property": each_goods.product_id.get_property_str(),
-                        } for each_goods in order.order_line
+                            "propertyChildIds": each_goods.product_id.attr_val_str,
+                        } for each_goods in order.order_line if each_goods.product_id.id!=delivery_product_id
                     ],
                     "logistics": {
                         "address": order.address,
                         "cityId": order.city_id.id,
                         "code": order.zipcode,
-                        "dateUpdate": order.write_date,
+                        "dateUpdate": dt_convert(order.write_date),
                         "districtId": order.district_id.id or 0,
                         "linkMan": order.linkman,
                         "mobile": order.mobile,
                         "provinceId": order.province_id.id,
                         "shipperCode": order.shipper_id.code if order.shipper_id else '',
                         "shipperName": order.shipper_id.name if order.shipper_id else '',
-                        "status": int(traces.get('State', 0)) if order.shipper_id else '',
+                        "status": 0 if order.shipper_id else '',
                         "trackingNumber": order.shipper_no if order.shipper_no else ''
                     },
                 },
                 "msg": "success"
             }
-            traces_list = traces.get('Traces')
-            if traces_list:
-                data["data"]["logisticsTraces"] = traces_list
+            if order.shipper_no:
+                self.build_traces(order, data)
+            self.build_ext(order, data)
 
             return self.res_ok(data["data"])
 
         except Exception as e:
             _logger.exception(e)
-            return self.res_err(-1, e.message)
+            return self.res_err(-1, str(e))
 
+    def build_traces(self, order, data):
+        pass
 
-    @http.route('/<string:sub_domain>/order/close', auth='public', method=['GET'])
-    def close(self, sub_domain, token=None, order_id=None, **kwargs):
+    def build_ext(self, order, data):
+        pass
+
+    @http.route('/wxa/<string:sub_domain>/order/close', auth='public', method=['GET', 'POST'], csrf=False)
+    def close(self, sub_domain, token=None, orderId=None, **kwargs):
+        order_id = orderId
         try:
             res, wechat_user, entry = self._check_user(sub_domain, token)
             if res:return res
@@ -335,7 +410,11 @@ class WxappOrder(http.Controller, BaseController):
             if not order:
                 return self.res_err(404)
 
-            order.write({'customer_status': 'closed', 'state': 'cancel'})
+            if order.state=='sale':
+                return self.res_err(-99, u'该订单已被确认，无法取消')
+
+            #order.write({'customer_status': 'closed'})
+            order.action_cancel()
 
             #mail_template = request.env.ref('wechat_mall_order_closed')
             #mail_template.sudo().send_mail(order.id, force_send=True, raise_exception=False)
@@ -344,11 +423,14 @@ class WxappOrder(http.Controller, BaseController):
 
         except Exception as e:
             _logger.exception(e)
-            return self.res_err(-1, e.message)
+            return self.res_err(-1, str(e))
 
 
-    @http.route('/<string:sub_domain>/order/delivery', auth='public', method=['GET'])
+    @http.route('/wxa/<string:sub_domain>/order/delivery', auth='public', method=['GET', 'POST'], csrf=False)
     def delivery(self, sub_domain, token=None, orderId=None, **kwargs):
+        '''
+        确认收货接口
+        '''
         order_id = orderId
         try:
             res, wechat_user, entry = self._check_user(sub_domain, token)
@@ -374,72 +456,6 @@ class WxappOrder(http.Controller, BaseController):
 
         except Exception as e:
             _logger.exception(e)
-            return self.res_err(-1, e.message)
+            return self.res_err(-1, str(e))
 
-
-    @http.route('/<string:sub_domain>/order/reputation', auth='public', method=['GET'])
-    def reputation(self, sub_domain, token=None, order_id=None, reputation=2, **kwargs):
-        '''
-        {
-            "token": "xxx",
-            "orderId": "4",
-            "reputations": [{
-                "id": "4",
-                "reputation": "2",
-                "remark": "xxx"
-            }]
-        }
-        '''
-        try:
-            post_json = json.loads(kwargs.pop('postJsonString'))
-            token = post_json.get('token',None)
-            order_id = post_json.get('orderId',None)
-
-            res, wechat_user, entry = self._check_user(sub_domain, token)
-            if res:return res
-
-            if not order_id:
-                return self.res_err(300)
-
-            order = request.env['sale.order'].sudo().search([
-                ('partner_id', '=', wechat_user.partner_id.id),
-                ('id', '=', int(order_id))
-            ])
-
-            if not order:
-                return self.res_err(404)
-
-            order.write({'customer_status': 'completed'})
-
-            return request.make_response(json.dumps({'code': 0, 'msg': 'success'}))
-
-        except Exception as e:
-            _logger.exception(e)
-            return self.res_err(-1, e.message)
-
-
-    @http.route('/<string:sub_domain>/order/pay', auth='public', method=['POST'], csrf=False)
-    def pay(self, sub_domain, token=None, orderId=None, **kwargs):
-        order_id = orderId
-        try:
-            res, wechat_user, entry = self._check_user(sub_domain, token)
-            if res:return res
-
-            if not order_id:
-                return self.res_err(300)
-
-            order = request.env['sale.order'].sudo().search([
-                ('partner_id', '=', wechat_user.partner_id.id),
-                ('id', '=', int(order_id))
-            ])
-
-            if not order:
-                return self.res_err(404)
-
-            order.write({'customer_status': 'pending', 'state': 'sale'})
-            return request.make_response(json.dumps({'code': 0, 'msg': 'success'}))
-
-        except Exception as e:
-            _logger.exception(e)
-            return self.res_err(-1, e.message)
 

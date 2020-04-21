@@ -15,21 +15,6 @@ _logger = logging.getLogger(__name__)
 
 class WxappAddress(http.Controller, BaseController):
 
-    @http.route('/<string:sub_domain>/user/amount', auth='public', methods=['GET'])
-    def user_amount(self, sub_domain, token=None):
-        try:
-            res, wechat_user, entry = self._check_user(sub_domain, token)
-            if res:return res
-            _data = {
-                'balance': 10,
-                'score': 10,
-            }
-            return self.res_ok(_data)
-
-        except Exception as e:
-            _logger.exception(e)
-            return self.res_err(-1, e.message)
-
     def _get_address_dict(self, each_address, wxapp_user_id):
         _dict = {
             "address": each_address.street,
@@ -53,7 +38,7 @@ class WxappAddress(http.Controller, BaseController):
         }
         return _dict
 
-    @http.route('/<string:sub_domain>/user/shipping-address/list', auth='public', methods=['GET'])
+    @http.route('/wxa/<string:sub_domain>/user/shipping-address/list', auth='public', methods=['GET'])
     def list(self, sub_domain, token=None):
         try:
             res, wechat_user, entry = self._check_user(sub_domain, token)
@@ -67,10 +52,10 @@ class WxappAddress(http.Controller, BaseController):
 
         except Exception as e:
             _logger.exception(e)
-            return self.res_err(-1, e.message)
+            return self.res_err(-1, str(e))
 
 
-    @http.route('/<string:sub_domain>/user/shipping-address/add', auth='public', methods=['GET','POST'], csrf=False, type='http')
+    @http.route('/wxa/<string:sub_domain>/user/shipping-address/add', auth='public', methods=['GET','POST'], csrf=False, type='http')
     def add(self, sub_domain, **kwargs):
         try:
             token = kwargs.get('token', None)
@@ -99,10 +84,10 @@ class WxappAddress(http.Controller, BaseController):
 
         except Exception as e:
             _logger.exception(e)
-            return self.res_err(-1, e.message)
+            return self.res_err(-1, str(e))
 
 
-    @http.route('/<string:sub_domain>/user/shipping-address/update', auth='public', methods=['GET','POST'], csrf=False, type='http')
+    @http.route('/wxa/<string:sub_domain>/user/shipping-address/update', auth='public', methods=['GET','POST'], csrf=False, type='http')
     def update(self, sub_domain, **kwargs):
         try:
             token = kwargs.get('token', None)
@@ -134,10 +119,10 @@ class WxappAddress(http.Controller, BaseController):
 
         except Exception as e:
             _logger.exception(e)
-            return self.res_err(-1, e.message)
+            return self.res_err(-1, str(e))
 
 
-    @http.route('/<string:sub_domain>/user/shipping-address/delete', auth='public', methods=['GET'])
+    @http.route('/wxa/<string:sub_domain>/user/shipping-address/delete', auth='public', methods=['GET', 'POST'], csrf=False)
     def delete(self, sub_domain, token=None, id=None, **kwargs):
         address_id = id
         try:
@@ -152,7 +137,7 @@ class WxappAddress(http.Controller, BaseController):
             if not address:
                 return self.res_err(404)
 
-            address.unlink()
+            address.write({'active': False})
 
             if wechat_user.address_ids:
                 wechat_user.address_ids[0].write({'is_default': True})
@@ -161,10 +146,10 @@ class WxappAddress(http.Controller, BaseController):
 
         except Exception as e:
             _logger.exception(e)
-            return self.res_err(-1, e.message)
+            return self.res_err(-1, str(e))
 
 
-    @http.route('/<string:sub_domain>/user/shipping-address/default', auth='public', methods=['GET'])
+    @http.route('/wxa/<string:sub_domain>/user/shipping-address/default', auth='public', methods=['GET'])
     def default(self, sub_domain, token=None, **kwargs):
         try:
             res, wechat_user, entry = self._check_user(sub_domain, token)
@@ -183,10 +168,10 @@ class WxappAddress(http.Controller, BaseController):
 
         except Exception as e:
             _logger.exception(e)
-            return self.res_err(-1, e.message)
+            return self.res_err(-1, str(e))
 
 
-    @http.route('/<string:sub_domain>/user/shipping-address/detail', auth='public', methods=['GET'])
+    @http.route('/wxa/<string:sub_domain>/user/shipping-address/detail', auth='public', methods=['GET'])
     def detail(self, sub_domain, token=None, id=None, **kwargs):
         address_id = id
         try:
@@ -205,4 +190,4 @@ class WxappAddress(http.Controller, BaseController):
 
         except Exception as e:
             _logger.exception(e)
-            return self.res_err(-1, e.message)
+            return self.res_err(-1, str(e))

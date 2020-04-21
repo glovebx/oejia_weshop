@@ -15,4 +15,6 @@ from . import wxapp_access_token
 from . import wxapp_banner
 from . import wxapp_product_category
 from . import wxapp_payment
+from . import wxapp_confirm_wizard
+from . import wxapp_notice
 
